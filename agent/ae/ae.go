@@ -93,67 +93,64 @@ func (s *StateSyncer) Run() {
 
 FullSync:
 	for {
-		// attempt a full sync
-		err := s.State.SyncFull()
+		switch err := s.State.SyncFull(); {
 
-		// full sync successful, now wait for changes
-		if err == nil {
-			break
-		}
+		// full sync failed
+		case err != nil:
+			s.Logger.Printf("[ERR] agent: failed to sync remote state: %v", err)
 
-		s.Logger.Printf("[ERR] agent: failed to sync remote state: %v", err)
-
-		// full sync failed.
-		select {
-
-		// consul server added to cluster.
-		// retry sooner than retryFailIntv to converge cluster sooner
-		// but stagger delay to avoid thundering herd
-		case <-s.ServerUpCh:
 			select {
-			case <-time.After(stagger(serverUpIntv)):
+			// consul server added to cluster.
+			// retry sooner than retryFailIntv to converge cluster sooner
+			// but stagger delay to avoid thundering herd
+			case <-s.ServerUpCh:
+				select {
+				case <-time.After(stagger(serverUpIntv)):
+				case <-s.ShutdownCh:
+					return
+				}
+
+			// retry full sync after some time
+			// todo(fs): why don't we use s.Interval here?
+			case <-time.After(retryFailIntv + stagger(retryFailIntv)):
+
 			case <-s.ShutdownCh:
 				return
 			}
 
-		// retry full sync after some time
-		// todo(fs): why don't we use s.Interval here?
-		case <-time.After(retryFailIntv + stagger(retryFailIntv)):
+		// full sync OK
+		default:
+			// force-trigger sync to pickup any changes
+			s.triggerSync()
 
-		case <-s.ShutdownCh:
-			return
-		}
-	}
+			// do partial syncs until it is time for a full sync again
+			for {
+				select {
+				// todo(fs): why don't we honor the ServerUpCh here as well?
+				// todo(fs): by default, s.Interval is 60s which is >> 3s (serverUpIntv)
+				// case <-s.ServerUpCh:
+				// 	select {
+				// 	case <-time.After(stagger(serverUpIntv)):
+				// 		continue FullSync
+				// 	case <-s.ShutdownCh:
+				// 		return
+				// 	}
 
-	// Force-trigger sync to pickup any changes
-	s.triggerSync()
+				case <-time.After(s.Interval + stagger(s.Interval)):
+					continue FullSync
 
-	// Wait for sync events
-	for {
-		select {
-		// todo(fs): why don't we honor the ServerUpCh here as well?
-		// todo(fs): by default, s.Interval is 60s which is >> 3s (serverUpIntv)
-		// case <-s.ServerUpCh:
-		// 	select {
-		// 	case <-time.After(stagger(serverUpIntv)):
-		// 		continue FullSync
-		// 	case <-s.ShutdownCh:
-		// 		return
-		// 	}
+				case <-s.TriggerCh:
+					if s.Paused() {
+						continue
+					}
+					if err := s.State.SyncChanges(); err != nil {
+						s.Logger.Printf("[ERR] agent: failed to sync changes: %v", err)
+					}
 
-		case <-time.After(s.Interval + stagger(s.Interval)):
-			goto FullSync
-
-		case <-s.TriggerCh:
-			if s.Paused() {
-				continue
+				case <-s.ShutdownCh:
+					return
+				}
 			}
-			if err := s.State.SyncChanges(); err != nil {
-				s.Logger.Printf("[ERR] agent: failed to sync changes: %v", err)
-			}
-
-		case <-s.ShutdownCh:
-			return
 		}
 	}
 }
